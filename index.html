@@ -1,0 +1,456 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>显卡工作原理 · GPU 织布机</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{width:100%;height:100%;overflow:hidden;background:#07090d}
+  body{font-family:"PingFang SC","Hiragino Sans GB","Microsoft YaHei",ui-sans-serif,system-ui,sans-serif}
+  .stage{position:relative;width:1920px;height:1080px;background:radial-gradient(1200px 800px at 50% 42%,#101724 0%,#0a0e15 55%,#07090d 100%);overflow:hidden}
+  svg.world{position:absolute;inset:0;width:1920px;height:1080px;display:block}
+  .hud{position:absolute;color:#dbe4ee;pointer-events:none;user-select:none}
+  .title{top:44px;left:56px}
+  .title .kicker{font-size:19px;letter-spacing:6px;color:#7d8fa6;font-weight:500}
+  .title h1{font-size:42px;font-weight:700;margin-top:6px;letter-spacing:2px}
+  .title h1 .accent{color:#f5a623}
+  .chap{top:46px;right:56px;text-align:right;font-size:22px;color:#8ea0b8;letter-spacing:2px}
+  .chap b{display:block;font-size:52px;color:#e8eef6;font-weight:700;letter-spacing:0;line-height:1.05}
+  .readout{top:150px;right:56px;text-align:right;font-size:21px;color:#9fb2c9;font-variant-numeric:tabular-nums}
+  .readout b{color:#ffc45c;font-weight:600}
+  .subtitle{left:50%;bottom:54px;transform:translateX(-50%);text-align:center;width:1500px}
+  .subtitle .bar{display:inline-block;padding:14px 44px 16px;border:1px solid rgba(140,170,210,.28);border-radius:14px;background:rgba(10,15,23,.72);backdrop-filter:blur(4px)}
+  .subtitle h2{font-size:38px;font-weight:700;color:#f3f7fc;letter-spacing:1px}
+  .subtitle p{margin-top:6px;font-size:23px;color:#9fb2c9}
+  .subtitle h2 .am{color:#f5a623}
+  .vignette{position:absolute;inset:0;box-shadow:inset 0 0 240px rgba(0,0,0,.65);pointer-events:none}
+  .fade{position:absolute;inset:0;background:#07090d;pointer-events:none}
+</style>
+</head>
+<body>
+<div class="stage" id="stage">
+  <svg class="world" id="svg" viewBox="0 0 1920 1080" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+      <linearGradient id="beamGrad" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0" stop-color="#46536"/><stop offset="0" stop-color="#465366"/>
+        <stop offset="1" stop-color="#202835"/>
+      </linearGradient>
+    </defs>
+    <g id="cam"></g>
+  </svg>
+  <div class="hud title">
+    <div class="kicker">ANATOMY OF A GPU</div>
+    <h1>显卡工作原理 · <span class="accent">GPU 织布机</span></h1>
+  </div>
+  <div class="hud chap" id="chap"></div>
+  <div class="hud readout" id="readout"></div>
+  <div class="hud subtitle" id="subtitle"></div>
+  <div class="vignette"></div>
+  <div class="fade" id="fade"></div>
+</div>
+<script>
+"use strict";
+/* ================= 确定性时钟 / 章节 ================= */
+const T_END = 48000;
+const CHAPTERS = [
+  { t0:0,     t1:8000,  n:"01", title:"GPU 是什么？",        sub:"成千上万个线程同时开工 —— 就像一台有着千百根经线的织布机" },
+  { t0:8000,  t1:16000, n:"02", title:"穿孔卡 = 着色器程序", sub:"所有线程读取同一张卡、执行同一条指令 —— SIMD 的单指令多数据" },
+  { t0:16000, t1:24000, n:"03", title:"Warp = 32 线程齐步走", sub:"每 32 根经线绑成一组，一个踏板统控升降 —— 这就是 SIMT lockstep" },
+  { t0:24000, t1:32000, n:"04", title:"梭子 = 显存带宽",     sub:"梭子在张开的梭口中高速穿行，把数据纬线喂给每一个核心" },
+  { t0:32000, t1:40000, n:"05", title:"线程分歧",            sub:"同组线程遇到 if 分支：一半升起工作，另一半只能原地空转等待" },
+  { t0:40000, t1:48000, n:"06", title:"织成画面 = 帧",       sub:"每行纬线就是一排像素，织完一幅自动卷走 —— 每秒 60 帧" },
+];
+const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+const easeIO=x=>{x=clamp(x,0,1);return x*x*(3-2*x)};
+const lerp=(a,b,t)=>a+(b-a)*t;
+function chapterAt(t){ for(const c of CHAPTERS){ if(t>=c.t0&&t<c.t1) return c; } return CHAPTERS[5]; }
+function segP(t,t0,d){return clamp((t-t0)/d,0,1)}
+
+/* 相机：每章给一个世界 AABB 聚焦框，自动 fit 到屏幕安全区 */
+const SCREEN={x0:64,x1:1856,y0:212,y1:936};
+const FOCUS=[
+  {x0:-165,x1:165,y0:-12,y1:246,z0:-200,z1:220},
+  {x0:-130,x1:40,  y0:150,y1:248,z0:-205,z1:-128},
+  {x0:-92, x1:92, y0:86, y1:170,z0:-58,  z1:8},
+  {x0:-112,x1:112,y0:52, y1:118,z0:112,  z1:182},
+  {x0:-92, x1:92, y0:78, y1:172,z0:-62,  z1:10},
+  {x0:-110,x1:122,y0:18,y1:118,z0:110,z1:214},
+];
+function fitCam(f){
+  const cs=[
+    [f.x0,f.y0,f.z0],[f.x1,f.y0,f.z0],[f.x1,f.y0,f.z1],[f.x0,f.y0,f.z1],
+    [f.x0,f.y1,f.z0],[f.x1,f.y1,f.z0],[f.x1,f.y1,f.z1],[f.x0,f.y1,f.z1],
+  ].map(q=>P(...q));
+  let nx=1e9,ny=1e9,mx=-1e9,my=-1e9;
+  for(const [u,v] of cs){nx=Math.min(nx,u);mx=Math.max(mx,u);ny=Math.min(ny,v);my=Math.max(my,v);}
+  const s=Math.min((SCREEN.x1-SCREEN.x0)/(mx-nx),(SCREEN.y1-SCREEN.y0)/(my-ny));
+  return { s, cx:(SCREEN.x0+SCREEN.x1)/2-s*(nx+mx)/2, cy:(SCREEN.y0+SCREEN.y1)/2-s*(ny+my)/2 };
+}
+let CAM=null;
+function getCam(){ if(!CAM) CAM=FOCUS.map(fitCam); return CAM; }
+function camAt(t){
+  let i=CHAPTERS.findIndex(c=>t>=c.t0&&t<c.t1); if(i<0)i=5;
+  const c=CHAPTERS[i], p=easeIO(segP(t,c.t0,1500));
+  const CAM=getCam();
+  const a=CAM[Math.max(0,i-1)], b=CAM[i], k=i===0?1:p;
+  return { s:lerp(a.s,b.s,k), cx:lerp(a.cx,b.cx,k), cy:lerp(a.cy,b.cy,k) };
+}
+
+/* ================= 等距投影 ================= */
+const C30=Math.cos(Math.PI/6), S30=Math.sin(Math.PI/6);
+const CE=Math.cos(22*Math.PI/180), SE=Math.sin(22*Math.PI/180);
+function P(x,y,z){ return [x*C30+z*S30, -x*S30*CE+z*C30*SE-(y||0)]; }
+const NS="http://www.w3.org/2000/svg";
+function el(name,attrs){const e=document.createElementNS(NS,name);for(const k in attrs)e.setAttribute(k,attrs[k]);return e}
+function poly(points,attrs){return el("polygon",Object.assign({points:points.map(q=>q[0].toFixed(1)+","+q[1].toFixed(1)).join(" ")},attrs));}
+function line(p1,p2,attrs){return el("line",Object.assign({x1:p1[0],y1:p1[1],x2:p2[0],y2:p2[1]},attrs));}
+const COL={  metal:"#3a4658", metalHi:"#5a6b84", metalLo:"#232c3a",
+  darkMetal:"#2a3342", brass:"#c9923f", brassHi:"#e8b96a", brassLo:"#8a5f24",
+  wood:"#5b4636", woodHi:"#7a5f49", woodLo:"#3d2f24",
+  card:"#d8c9a8", cardHole:"#12161d",
+  thread:"#6f8aae", threadHi:"#ffc45c", threadOff:"#4a5464",
+  weft:"#9fc3e8", reed:"#9fb4cf", floor:"#1a2230", floorEdge:"#33425a",
+  green:"#4fd6a0", red:"#e8645a", cyan:"#66d9ef",
+};
+/* 长方体：中心(x,z)，宽 w（x向）深 d（z向），y0底 y1顶 */
+function box(g,o){
+  const {x,z,w,d,y0,y1}=o;
+  const A=P(x-w/2,y0,z-d/2),B=P(x+w/2,y0,z-d/2),C=P(x+w/2,y0,z+d/2),D=P(x-w/2,y0,z+d/2);
+  const A1=P(x-w/2,y1,z-d/2),B1=P(x+w/2,y1,z-d/2),C1=P(x+w/2,y1,z+d/2),D1=P(x-w/2,y1,z+d/2);
+  const c=o.c||COL.metal;
+  g.appendChild(poly([A1,B1,C1,D1],{fill:COL.metalHi,opacity:.95}));
+  g.appendChild(poly([D,D1,C1,C],{fill:COL.darkMetal,opacity:.9}));
+  g.appendChild(poly([B,B1,C1,C],{fill:COL.metalLo,opacity:.9}));
+  g.appendChild(poly([A1,B1,C1,D1],{fill:"none",stroke:c,"stroke-width":1.1,opacity:.6}));
+}
+/* 沿 x 轴圆柱：x0..x1，半径 r，中心(y,z) */
+function cylX(g,o){
+  const {x0,x1,r,y,z}=o,c=o.c||COL.brass;
+  const a=P(x0,y-r,z-r*.35),b=P(x1,y-r,z-r*.35),d=P(x1,y+r,z+r*.35),e=P(x0,y+r,z+r*.35);
+  g.appendChild(poly([a,b,d,e],{fill:c}));
+  g.appendChild(el("ellipse",{cx:P(x0,y,z)[0],cy:P(x0,y,z)[1],rx:r*C30,ry:r*.62,fill:COL.brassLo}));
+  g.appendChild(el("ellipse",{cx:P(x1,y,z)[0],cy:P(x1,y,z)[1],rx:r*C30,ry:r*.62,fill:COL.brassHi}));
+  g.appendChild(el("ellipse",{cx:P(x1,y,z)[0],cy:P(x1,y,z)[1],rx:r*C30*.5,ry:r*.31,fill:COL.brassLo}));
+}
+function rod3(g,a,b,w,c){ g.appendChild(line(P(...a),P(...b),{stroke:c||COL.metalHi,"stroke-width":w||4,"stroke-linecap":"round"})); }
+function text3(g,x,y,z,s,size,fill,anchor,fw){
+  const q=P(x,y,z);
+  const t=el("text",{x:q[0],y:q[1],"font-size":size,fill:fill||"#dfe8f3","text-anchor":anchor||"middle","font-weight":fw||500});
+  t.textContent=s; g.appendChild(t); return t;
+}
+
+/* ================= 世界常量 ================= */
+const N=128;                 // 经线总数
+const X0=-78, X1=78;         // x 跨度
+const ZB=-150, ZF=188;       // 后梁 → 前卷
+const xi=i=>X0+(X1-X0)*i/(N-1);
+const HEED_Z=-28, REED_Z=120, FELL_Z=132, BREAST_Z=186;
+const BEAM_Y=150;
+/* heddle 眼位置：A/B 两片交替，随升降 y */
+function eyeY(i,state){ const a=(i%2===0); return a?(108+state.a*46):(108-state.b*46); }
+
+/* ================= 静态机器 ================= */
+function buildStatic(){
+  const g=el("g",{id:"static"});
+  /* 底板 */
+  (function(){
+    const x0=-120,x1=120,z0=ZB-30,z1=BREAST_Z+26,y0=-10,y1=2;
+    const A=P(x0,y0,z0),B=P(x1,y0,z0),C=P(x1,y0,z1),D=P(x0,y0,z1);
+    const A1=P(x0,y1,z0),B1=P(x1,y1,z0),C1=P(x1,y1,z1),D1=P(x0,y1,z1);
+    g.appendChild(poly([D,D1,C1,C],{fill:"#141b27"}));
+    g.appendChild(poly([B,B1,C1,C],{fill:"#10161f"}));
+    g.appendChild(poly([A1,B1,C1,D1],{fill:COL.floor}));
+    g.appendChild(poly([A1,B1,C1,D1],{fill:"none",stroke:COL.floorEdge,"stroke-width":1.4}));
+  })();
+  /* 四根立柱 */
+  for(const px of [-96,96]){ box(g,{x:px,z:ZB-14,w:9,d:9,y0:2,y1:182,c:COL.metal}); }
+  for(const px of [-96,96]){ box(g,{x:px,z:BREAST_Z+6,w:9,d:9,y0:2,y1:132,c:COL.metal}); }
+  /* 顶梁 2 根 */
+  box(g,{x:0,z:ZB-14,w:210,d:8,y0:176,y1:186,c:COL.metal});
+  box(g,{x:0,z:BREAST_Z+6,w:210,d:8,y0:126,y1:136,c:COL.metal});
+  /* 后梁（经线轴，满轴线）+ 前梁（胸梁） */
+  cylX(g,{x0:-92,x1:92,r:13,y:BEAM_Y,z:ZB-14,c:COL.brass});
+  cylX(g,{x0:-92,x1:92,r:5,y:92,z:BREAST_Z+6,c:COL.metal});
+  /* 后导纱杆 */
+  cylX(g,{x0:-88,x1:88,r:2.6,y:140,z:ZB+14,c:COL.metalHi});
+  /* 综框：两片矩形框，位于 HEED_Z */
+  heddleFrame(g,-46); heddleFrame(g,46);
+  /* 钢筘 */
+  box(g,{x:0,z:REED_Z,w:166,d:3,y0:30,y1:150,c:COL.metal});
+  for(let k=0;k<64;k++){const xx=-80+160*k/63; rod3(g,[xx,34,REED_Z],[xx,146,REED_Z],1.1,"#8298b8");}
+  /* 走梭板 */
+  box(g,{x:0,z:FELL_Z+14,w:176,d:20,y0:52,y1:58,c:COL.wood});
+  /* 前卷布辊 + 棘轮 */
+  cylX(g,{x0:-88,x1:88,r:9,y:46,z:BREAST_Z+16,c:COL.brass});
+  g.appendChild(el("ellipse",{cx:P(92,46,BREAST_Z+16)[0]+14,cy:P(92,46,BREAST_Z+16)[1],rx:11,ry:11,fill:"none",stroke:COL.brassHi,"stroke-width":2.4}));
+  for(let k=0;k<10;k++){const a=k/10*Math.PI*2;const c=P(92,46,BREAST_Z+16);
+    g.appendChild(line([c[0]+14+Math.cos(a)*4,c[1]+Math.sin(a)*4],[c[0]+14+Math.cos(a)*11,c[1]+Math.sin(a)*11],{stroke:COL.brassHi,"stroke-width":2}));}
+  /* Jacard 机头箱 + 针板 */
+  box(g,{x:0,z:ZB-14,w:150,d:26,y0:188,y1:214,c:COL.darkMetal});
+  box(g,{x:0,z:ZB+2,w:150,d:4,y0:184,y1:188,c:COL.metal});
+  for(let k=0;k<32;k++){const xx=-70+140*k/31; rod3(g,[xx,188,ZB+2],[xx,186,ZB+2],2,"#cdd9e8");}
+  /* 踏板 2 个 */
+  treadle(g,-34); treadle(g,34);
+  return g;
+}
+function heddleFrame(g,off){
+  const x0=-84,x1=84,z=HEED_Z+off*.18;
+  box(g,{x:x0,z,w:4,d:3,y0:66,y1:152,c:COL.metal});
+  box(g,{x:x1,z,w:4,d:3,y0:66,y1:152,c:COL.metal});
+  box(g,{x:0,z,w:172,d:3,y0:148,y1:153,c:COL.metal});
+  box(g,{x:0,z,w:172,d:3,y0:65,y1:70,c:COL.metal});
+}
+function treadle(g,zc){
+  const A=P(-46,0,zc+26),B=P(46,0,zc+26),C=P(46,7,zc-20),D=P(-46,7,zc-20);
+  g.appendChild(poly([A,B,C,D],{fill:COL.wood}));
+  g.appendChild(poly([A,B,C,D],{fill:"none",stroke:COL.woodHi,"stroke-width":1}));
+}
+
+/* ================= 穿孔卡组（静态几何，动态平移/高亮） ================= */
+function buildCards(){
+  const g=el("g",{id:"cards"});
+  /* 卡链绕过机头左侧：一道挂下的弧 */
+  const cards=[
+    {x:-100,y:236,z:-176},{x:-100,y:210,z:-176},{x:-100,y:184,z:-176},{x:-100,y:158,z:-176},
+    {x:-78,y:146,z:-170},{x:-52,y:150,z:-160},{x:-30,y:172,z:-150},
+  ];
+  let prev=null;
+  cards.forEach((pos,k)=>{
+    const card=el("g",{class:"pcard"});
+    const w=30,h=20,x=pos.x,y=pos.y,z=pos.z;
+    const corners=[[x-w/2,y-h/2],[x+w/2,y-h/2],[x+w/2,y+h/2],[x-w/2,y+h/2]].map(q=>P(q[0],q[1],z));
+    card.appendChild(poly(corners,{fill:COL.card,stroke:"#8f7f5f","stroke-width":1}));
+    const prog=[[1,0,1,1],[0,1,1,0],[1,1,0,1]];
+    for(let r=0;r<3;r++)for(let c2=0;c2<4;c2++){
+      if(prog[r][c2]){
+        const hx=x-9+c2*6, hy=y-6+r*6;
+        const q=P(hx,hy,z+0.6);
+        card.appendChild(el("ellipse",{cx:q[0],cy:q[1],rx:1.7,ry:1.3,fill:COL.cardHole}));
+      }
+    }
+    card.appendChild(el("ellipse",(function(){const q=P(x,y-h/2,z+0.4);return {cx:q[0],cy:q[1],rx:2,ry:1.5,fill:"none",stroke:"#8f7f5f","stroke-width":1}})()));
+    g.appendChild(card);
+    if(prev){ g.appendChild(line(P(prev.x,prev.y+h/2,prev.z),P(x,y-h/2,z),{stroke:"#7a6a48","stroke-width":2.2})); }
+    prev=pos;
+  });
+  /* 末张卡连入机头 */
+  g.appendChild(line(P(-30,182,-150),P(-20,196,-160),{stroke:"#7a6a48","stroke-width":2.2}));
+  return g;
+}
+
+/* ================= 动态层 ================= */
+const dyn=el("g",{id:"dyn"});
+const ann=el("g",{id:"ann"});
+const PAL=[["#e8645a","#f08a5a"],["#66d9ef","#5aa8e8"],["#4fd6a0","#7fe0b8"],["#b58ce8","#8a6ae8"],["#f5c451","#e89a4a"]];
+function pixColor(c,r,frame){
+  const w=16,h=16,u=c%w,v=(r+frame*5)%h;
+  const f=(frame%3);
+  /* 三个三角形轮换 */
+  const tris=[
+    v>= Math.abs(u-8)+2,
+    v<= h-2-Math.abs(u-8),
+    Math.abs(u-8)+Math.abs(v-8)<=7,
+  ];
+  for(let k=0;k<3;k++){ if(tris[(k+f)%3]) return PAL[(k+f)%5][0]; }
+  return null;
+}
+function shadeThread(i,mode){ /* 返回颜色/透明度 */
+  if(mode==="warp"){
+    const wg=Math.floor(i/32);
+    if(wg===activeWarp) return COL.threadHi;
+  }
+  if(mode==="div"){
+    const wg=Math.floor(i/32);
+    if(wg===activeWarp) return (i%2===0)?COL.threadHi:COL.threadOff;
+  }
+  return COL.thread;
+}
+let activeWarp=0;
+
+function renderFrame(t){
+  const ch=chapterAt(t), ci=CHAPTERS.indexOf(ch);
+  const cp=segP(t,ch.t0,700);                     // 章节淡入
+  const lt=t-ch.t0;
+  /* ---- 状态机 ---- */
+  let a=0.04*Math.sin(t/900), b=0.04*Math.sin(t/900+1);
+  let mode="idle", shuttleOn=false, sx=0, rowsExtra=0, divRaise=null;
+  if(ci===1){ a=0.05*Math.sin(t/700); b=0.05*Math.sin(t/700+1); }
+  if(ci===2){
+    const period=1300, ph=(t-16000)%period/period, cyc=Math.floor((t-16000)/period);
+    if(ph<0.5){ a=easeIO(ph*2); b=0; } else { a=0; b=easeIO((ph-.5)*2); }
+    activeWarp=Math.floor(cyc/2)%4; mode="warp";
+  }
+  if(ci===3){
+    const period=1500, ph=(t-24000)%period/period;
+    a=1;b=0; mode="idle";
+    if(ph<0.34) sx=-100; else if(ph<0.86){ const q=easeIO((ph-.34)/.52); sx=-100+q*200; shuttleOn=true; } else sx=100;
+    rowsExtra=Math.floor((t-24000)/1500);
+  }
+  if(ci===4){
+    activeWarp=2; mode="div";
+    a=0.55; b=0; /* 同组里只有一半真升起 */
+  }
+  if(ci===5){
+    const period=1200, ph=(t-40000)%period/period, cyc=Math.floor((t-40000)/period);
+    if(ph<0.5){ a=easeIO(ph*2); b=0; } else { a=0; b=easeIO((ph-.5)*2); }
+    if(ph<0.30) sx=(cyc%2)?100:-100; else if(ph<0.82){ const dir=(cyc%2)?-1:1, q=easeIO((ph-.30)/.52); sx=dir*100*(1-q)+(-dir)*100*q; shuttleOn=true; }
+    rowsExtra=16+Math.floor((t-40000)/1200);
+    mode="idle";
+  }
+  const totalRows=26+rowsExtra;
+  const frame=128+Math.floor(totalRows/26);
+
+  /* ---- 经线 ---- */
+  let tp="";
+  for(let i=0;i<N;i++){
+    const x=xi(i), ey=eyeY(i,{a,b});
+    let col=COL.thread, op=.75, wdt=.9;
+    if(mode==="warp" && Math.floor(i/32)===activeWarp){ col=COL.threadHi; op=1; wdt=1.8; }
+    if(mode==="div" && Math.floor(i/32)===activeWarp){
+      if(i%2===0){ col=COL.threadHi; op=1; wdt=2.0; } else { col="#39424f"; op=.95; wdt=2.2; }
+    }
+    const p0=P(x,BEAM_Y,ZB-14),p1=P(x,140,ZB+14),p2=P(x,ey,HEED_Z),p3=P(x,104,REED_Z),p4=P(x,62,FELL_Z);
+    tp+=`<path d="M${p0[0].toFixed(1)} ${p0[1].toFixed(1)}L${p1[0].toFixed(1)} ${p1[1].toFixed(1)}L${p2[0].toFixed(1)} ${p2[1].toFixed(1)}L${p3[0].toFixed(1)} ${p3[1].toFixed(1)}L${p4[0].toFixed(1)} ${p4[1].toFixed(1)}" fill="none" stroke="${col}" stroke-width="${wdt}" opacity="${op}"/>`;
+  }
+  /* ---- 布面：梭口前到胸梁之间，27 行可见，随织造滚动 ---- */
+  const COLS=64, VROWS=27;
+  let cloth="";
+  const rowOffset=totalRows;
+  for(let r=0;r<VROWS;r++){
+    const rr=rowOffset-(VROWS-1-r);
+    const zA=FELL_Z-r*2-1, zB=zA-2;
+    for(let c=0;c<COLS;c++){
+      const col=pixColor(c,rr,frame);
+      if(!col) continue;
+      const xA=X0+(X1-X0)*c/COLS, xB=X0+(X1-X0)*(c+1)/COLS;
+      const q=[P(xA,58.6,zA),P(xB,58.6,zA),P(xB,58.6,zB),P(xA,58.6,zB)];
+      cloth+=`<polygon points="${q.map(p=>p[0].toFixed(1)+","+p[1].toFixed(1)).join(" ")}" fill="${col}" opacity=".92"/>`;
+    }
+  }
+  /* 布面整体（暗底） */
+  const qCloth=[P(X0,58.2,FELL_Z),P(X1,58.2,FELL_Z),P(X1,58.2,BREAST_Z+2),P(X0,58.2,BREAST_Z+2)];
+  /* ---- 梭子 ---- */
+  let shut="";
+  if(shuttleOn || ci===3){
+    const vis = shuttleOn?1:(ci===3?.35:0);
+    if(vis>0){
+      const x=sx, y=74, z=FELL_Z+6;
+      const L=20,Wd=8;
+      const sh=[
+        poly([P(x-L/2,y,z-Wd/2),P(x+L/2,y,z-Wd/2),P(x+L/2,y,z+Wd/2),P(x-L/2,y,z+Wd/2)],{fill:COL.woodHi,stroke:COL.brassHi,"stroke-width":1.2,opacity:vis}),
+        el("ellipse",(function(){const q=P(x,y+3,z);return {cx:q[0],cy:q[1],rx:6,ry:3.2,fill:COL.brassHi,stroke:COL.brassLo,"stroke-width":1,opacity:vis}})()),
+      ];
+      sh.forEach(n=>shut += new XMLSerializer().serializeToString(n));
+    }
+  }
+  dyn.innerHTML = cloth
+    + `<polygon points="${qCloth.map(p=>p[0].toFixed(1)+","+p[1].toFixed(1)).join(" ")}" fill="#101826" opacity=".88"/>`
+    + tp
+    + shut;
+
+  /* ---- 相机 ---- */
+  const cam=camAt(t);
+  camG.setAttribute("transform",`translate(${cam.cx} ${cam.cy}) scale(${cam.s})`);
+
+  /* ---- 穿孔卡链推进 + 高亮 ---- */
+  const adv=(t/260)%1;
+  cardsG.setAttribute("transform",`translate(0 ${(adv*24).toFixed(1)})`);
+  [...cardsG.querySelectorAll(".pcard")].forEach((c,k)=>{
+    c.setAttribute("opacity", ci===1? (k===2?1:.5) : .42);
+  });
+
+  /* ---- 标注 ---- */
+  renderAnnotations(ci,cp,{frame,totalRows,shuttleOn,activeWarp,a,b},cam.s);
+
+  /* ---- HUD ---- */
+  const fp=easeIO(cp);
+  document.getElementById("chap").innerHTML=`<span style="opacity:${fp}">CHAPTER</span><b style="opacity:${fp}">${ch.n} / 06</b>`;
+  document.getElementById("subtitle").innerHTML=
+    `<div class="bar" style="opacity:${fp}"><h2>${ch.title}</h2><p>${ch.sub}</p></div>`;
+  const ro=document.getElementById("readout");
+  const roLines=[
+    [`经线（线程）`,`128 根可见 · 实际 GPU 数以万计`],
+    [`着色器程序`,`同一条指令流 · 穿孔卡循环推进`],
+    [`Warp 调度`,`32 线程 / warp · SIMT lockstep · Warp #${activeWarp+1}/4`],
+    [`显存带宽`,`梭子往返 ${ (ci===3?(6+(t-24000)/400|0):0) } 次 · 数据喂入每个核心`],
+    [`线程利用率`,`活跃 16/32 · 空转 16/32 · 分支代价`],
+    [`帧输出`,`Frame #${frame} · 60 FPS · 16.7 ms / 帧`],
+  ][ci];
+  ro.innerHTML=`<b>${roLines[0]}</b><br>${roLines[1]}`;
+  document.getElementById("fade").style.opacity=0;
+}
+
+/* ================= 世界标注（在相机层内，反向缩放保持字号恒定） ================= */
+function annLabel(x,y,z,txt,sub,op,k,anchor){
+  if(op<=0.02) return "";
+  const q=P(x,y,z), halo='paint-order:stroke;stroke:#080b10;stroke-width:6px;stroke-linejoin:round';
+  return `<g transform="translate(${q[0].toFixed(1)} ${q[1].toFixed(1)}) scale(${inv0(k)}) translate(${-q[0].toFixed(1)} ${-q[1].toFixed(1)})" opacity="${op.toFixed(2)}" font-family="PingFang SC,sans-serif">
+    <text x="${q[0]}" y="${q[1]}" text-anchor="${anchor||"middle"}" font-size="15" fill="#aebfd6" style="${halo}">${sub||""}</text>
+    <text x="${q[0]}" y="${q[1]+27}" text-anchor="${anchor||"middle"}" font-size="24" font-weight="700" fill="#ffd483" style="${halo}">${txt}</text></g>`;
+}
+function inv0(k){return (1/k).toFixed(4);}
+function annDot(x,y,z,op,k){
+  if(op<=0.02) return "";
+  const q=P(x,y,z);
+  return `<circle cx="${q[0]}" cy="${q[1]}" r="${(4.5/k).toFixed(1)}" fill="#ffc45c" opacity="${op}"/><circle cx="${q[0]}" cy="${q[1]}" r="${(9/k).toFixed(1)}" fill="none" stroke="#ffc45c" stroke-width="1.4" opacity="${(op*.6).toFixed(2)}"/>`;
+}
+function leaderDot(x1,y1,z1,x2,y2,z2,op,k){
+  if(op<=0.02) return "";
+  const a=P(x1,y1,z1),b=P(x2,y2,z2);
+  return `<line x1="${a[0]}" y1="${a[1]}" x2="${b[0]}" y2="${b[1]}" stroke="#ffc45c" stroke-width="${(1.6/k).toFixed(2)}" stroke-dasharray="${(4/k).toFixed(1)} ${(3/k).toFixed(1)}" opacity="${op}"/>`;
+}
+function renderAnnotations(ci,op,s,k){
+  let h="";
+  const e=easeIO(op);
+  if(ci===0){ h+=annLabel(0,250,-60,"经线 = GPU 线程",`${N} 根可见，真实 GPU 上是成千上万`,e,k); h+=annDot(xi(64),108,HEED_Z,e,k); }
+  if(ci===1){ h+=annLabel(-100,244,-176,"穿孔卡 = 着色器程序","所有线程读同一张卡，执行同一条指令",e,k); h+=annDot(-100,184,-176,e,k); }
+  if(ci===2){
+    const i0=activeWarp*32, ty=eyeY(i0,{a:s.a,b:s.b});
+    h+=annDot(xi(i0+16),ty+4,HEED_Z,e,k);
+    h+=leaderDot(xi(i0+16),ty+4,HEED_Z,128,118,-24,e,k);
+    h+=annLabel(140,126,-24,"32 根 = 1 个 Warp","一个踏板：32 线程同时升降（lockstep）",e,k);
+  }
+  if(ci===3){ h+=annDot(0,78,FELL_Z+6,e,k); h+=leaderDot(0,78,FELL_Z+6,46,102,188,e,k); h+=annLabel(66,112,192,"梭子 = 显存带宽","在梭口中高速穿行，把数据纬线喂给核心",e,k); }
+  if(ci===4){
+    const iUp=activeWarp*32+16, iDn=activeWarp*32+1;
+    h+=annDot(xi(iUp),eyeY(iUp,{a:.55,b:0}),HEED_Z,e,k);
+    h+=leaderDot(xi(iUp),150,HEED_Z,130,150,-20,e,k);
+    h+=annLabel(150,156,-20,"升起工作的 16 线程","执行 if 为真的分支",e,k);
+    h+=annDot(xi(iDn),104,HEED_Z,e,k);
+    h+=leaderDot(xi(iDn),100,HEED_Z,130,92,12,e,k);
+    h+=annLabel(150,98,12,"原地空转的 16 线程","分支不一致 → 线程分歧",e,k);
+  }
+  if(ci===5){
+    h+=annDot(0,60,FELL_Z-10,e,k);
+    h+=annLabel(-70,104,212,"布面 = 帧缓冲","每行纬线 = 一排像素",e,k);
+    h+=annLabel(118,100,210,"卷走 → 下一帧","每秒 60 幅（60 FPS）",e,k);
+  }
+  ann.innerHTML=h;
+}
+
+/* ================= 启动 ================= */
+const svg=document.getElementById("svg"), camG=el("g",{id:"cam"});
+const staticG=buildStatic();
+const cardsG=buildCards();
+camG.appendChild(staticG); camG.appendChild(dyn); camG.appendChild(cardsG); camG.appendChild(ann);
+svg.appendChild(camG);
+
+const params=new URLSearchParams(location.search);
+const fixedT=params.get("t");
+if(fixedT!==null){
+  renderFrame(clamp(Number(fixedT)||0,0,T_END-1));
+  window.__setT=(v)=>{ renderFrame(clamp(Number(v)||0,0,T_END-1)); return document.querySelectorAll("#cam path,#cam polygon").length; };
+}else{
+  let start=performance.now();
+  (function loop(now){
+    renderFrame((now-start)%T_END);
+    requestAnimationFrame(loop);
+  })(start);
+  window.addEventListener("keydown",e=>{
+    if(e.key>="1"&&e.key<="6"){ start=performance.now()-CHAPTERS[Number(e.key)-1].t0-2000; }
+  });
+}
+</script>
+</body>
+</html>
